@@ -1,0 +1,193 @@
+/**
+ * Exporta "RawData" y concatena datos de "INFRA" y "Cyber"
+ * en un único CSV "METADATA BM.csv" en la carpeta FOLDER_ID.
+ * - Cabecera tomada solo de RawData
+ * - INFRA y Cyber aportan solo datos (sin sus cabeceras)
+ * - Omite filas donde la columna B esté vacía
+ * - Normaliza PAIS_BM:
+ *    * Procesa listas "Akros;CR;SV;GT;MX;NI;PEX;Bamb?" → "AK,CR,SV,GT,MX,NI,PX,BA"
+ *    * AKROS→AK, PEX→PX, tokens que empiezan por BAMB→BA, demás se mantienen en mayúsculas
+ * - Formato fecha: DD/MM/YYYY (TIMEZONE: America/Costa_Rica)
+ * - Reemplazo atómico + eliminación de duplicados previos
+ */
+
+const CONFIG = {
+  SPREADSHEET_ID: '1O-zcmKj6NYLT4-o7e9eNNzyewmKR5gj8ys9grxJUf58',
+  SHEET_NAMES: ['RawData', 'INFRA', 'Cyber'], // orden de lectura
+  OUTPUT_NAME: 'METADATA BM.csv',
+  FOLDER_ID: '1ByhS3uEpPKDvK1h-DXLkRj970b3KFkYG',
+
+  TIMEZONE: 'America/Costa_Rica',
+  DATE_FORMAT: 'dd/MM/yyyy', // DD/MM/YYYY
+  DELIMITER: ',',            // cambia a ';' si lo requieren
+  ADD_BOM: true,             // Excel (Windows) friendly
+  LINE_ENDING: '\n',         // usa '\r\n' si lo requieren
+  TRIM_TRAILING_EMPTY_ROWS: true
+};
+
+function exportMetadataBM() {
+  const {
+    SPREADSHEET_ID, SHEET_NAMES, OUTPUT_NAME, FOLDER_ID,
+    TIMEZONE, DATE_FORMAT, DELIMITER, ADD_BOM, LINE_ENDING,
+    TRIM_TRAILING_EMPTY_ROWS
+  } = CONFIG;
+
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+
+  // -------- Utilidades --------
+  const formatDate = (d) => Utilities.formatDate(d, TIMEZONE, DATE_FORMAT);
+  const isDateNumber = (n) => (typeof n === 'number' && n > 0 && n < 40000);
+  const excel1900ToDate = (n) => {
+    const base = new Date(Date.UTC(1899, 11, 30));
+    return new Date(base.getTime() + n * 24 * 60 * 60 * 1000);
+  };
+  const formatCell = (cell) => {
+    if (cell === null || cell === undefined) return '';
+    if (cell instanceof Date && !isNaN(cell.getTime())) return formatDate(cell);
+    if (isDateNumber(cell)) return formatDate(excel1900ToDate(cell));
+    return String(cell);
+  };
+  const escapeCSV = (s) => {
+    if (s.includes('"')) s = s.replace(/"/g, '""');
+    const needsQuotes = s.includes('"') || s.includes(DELIMITER) || /[\n\r]/.test(s);
+    return needsQuotes ? `"${s}"` : s;
+  };
+  const trimTrailingEmpty = (values) => {
+    if (!TRIM_TRAILING_EMPTY_ROWS) return values;
+    while (values.length && values[values.length - 1].every(v => v === '' || v === null)) {
+      values.pop();
+    }
+    return values;
+  };
+  const filterColBNotEmpty = (rows) => rows.filter(r => r && r[1] !== '' && r[1] !== null);
+
+  // --- Normalizador de PAIS_BM: procesa listas separadas por ; , o espacios ---
+  const normalizePais = (raw) => {
+    if (raw === null || raw === undefined) return '';
+    const str = String(raw).trim();
+    if (str === '') return '';
+
+    // separar por ; , o espacios (uno o más), ignorando vacíos
+    const tokens = str.split(/[;,]+|\s+/).map(t => t.trim()).filter(Boolean);
+
+    const mapToken = (t) => {
+      const up = t.toUpperCase();
+      if (up === 'AKROS') return 'AK';
+      if (up === 'PEX') return 'PX';
+      if (/^BAMB/.test(up)) return 'BA'; // Bamb?, Bambu, Bambú, etc.
+      // Países/códigos se dejan tal cual en mayúsculas
+      return up;
+    };
+
+    const mapped = tokens.map(mapToken);
+
+    // Unificar y quitar duplicados preservando orden
+    const seen = new Set();
+    const dedup = [];
+    for (const m of mapped) {
+      if (!seen.has(m)) {
+        seen.add(m);
+        dedup.push(m);
+      }
+    }
+    // devolver como lista separada por comas (se citará si es necesario)
+    return dedup.join(',');
+  };
+
+  // -------- 1) Leer RawData (cabecera base) --------
+  const mainSheetName = SHEET_NAMES[0];
+  const mainSheet = ss.getSheetByName(mainSheetName);
+  if (!mainSheet) throw new Error(`No se encontró la hoja "${mainSheetName}".`);
+
+  let mainValues = trimTrailingEmpty(mainSheet.getDataRange().getValues());
+  if (!mainValues.length) throw new Error(`La hoja "${mainSheetName}" está vacía.`);
+
+  const baseHeaders = mainValues[0].map(h => String(h).trim());
+  const idxPais = baseHeaders.indexOf('PAIS_BM'); // índice columna PAIS_BM (si existe)
+
+  // Datos de RawData (sin cabecera) + filtro columna B
+  let mergedRows = [baseHeaders];
+  let rawRows = filterColBNotEmpty(mainValues.slice(1));
+  mergedRows = mergedRows.concat(rawRows);
+  Logger.log(`[${mainSheetName}] filas exportadas: ${rawRows.length}`);
+
+  // -------- 2) Leer INFRA y Cyber (sin encabezado) --------
+  const readDataOnly = (sheetName) => {
+    const sh = ss.getSheetByName(sheetName);
+    if (!sh) throw new Error(`No se encontró la hoja "${sheetName}".`);
+    let values = trimTrailingEmpty(sh.getDataRange().getValues());
+    if (values.length <= 1) {
+      Logger.log(`[${sheetName}] sin datos (solo cabecera o vacío)`);
+      return [];
+    }
+    const dataRows = filterColBNotEmpty(values.slice(1)); // quitar cabecera y filtrar B
+    Logger.log(`[${sheetName}] filas exportadas: ${dataRows.length}`);
+    return dataRows;
+  };
+
+  for (const s of SHEET_NAMES.slice(1)) {
+    mergedRows = mergedRows.concat(readDataOnly(s));
+  }
+
+  // -------- 3) Normalizar PAIS_BM en TODAS las filas --------
+  if (idxPais >= 0) {
+    for (let i = 1; i < mergedRows.length; i++) { // saltar cabecera
+      mergedRows[i][idxPais] = normalizePais(mergedRows[i][idxPais]);
+    }
+  } else {
+    Logger.log('Aviso: columna "PAIS_BM" no encontrada en cabecera de RawData.');
+  }
+
+  // -------- 4) Construir CSV --------
+  const lines = mergedRows.map(row =>
+    row.map(cell => escapeCSV(formatCell(cell))).join(DELIMITER)
+  );
+  const csvString = lines.join(LINE_ENDING);
+
+  // -------- 5) Guardar (reemplazo atómico + eliminar duplicados) --------
+  const newFile = saveCsvAtomically(csvString, OUTPUT_NAME, FOLDER_ID, ADD_BOM);
+  Logger.log(`OK: ${OUTPUT_NAME} (total filas exportadas: ${mergedRows.length - 1}) → ${newFile.getUrl()}`);
+}
+
+/**
+ * Crea un archivo CSV nuevo en FOLDER_ID (reemplazo atómico) y
+ * manda a papelera cualquier archivo previo con el mismo nombre.
+ * Retorna el File recién creado.
+ */
+function saveCsvAtomically(csvString, OUTPUT_NAME, FOLDER_ID, ADD_BOM) {
+  // 1) Bytes (con/sin BOM)
+  const utf8Bytes = Utilities.newBlob(csvString, 'text/plain').getBytes();
+  const bom = [0xEF, 0xBB, 0xBF];
+  const finalBytes = ADD_BOM ? bom.concat(utf8Bytes) : utf8Bytes;
+
+  // 2) Carpeta destino
+  let targetFolder;
+  try {
+    targetFolder = DriveApp.getFolderById(FOLDER_ID);
+  } catch (e) {
+    throw new Error(`No se pudo abrir la carpeta destino (${FOLDER_ID}). Verifica permisos y el ID.`);
+  }
+
+  // 3) Crear archivo nuevo (paso atómico)
+  const blob = Utilities.newBlob(finalBytes, 'text/csv', OUTPUT_NAME);
+  const newFile = targetFolder.createFile(blob);
+
+  // 4) Eliminar duplicados previos con el mismo nombre
+  const files = targetFolder.getFilesByName(OUTPUT_NAME);
+  while (files.hasNext()) {
+    const f = files.next();
+    if (f.getId() !== newFile.getId()) {
+      try {
+        f.setTrashed(true);
+      } catch (e) {
+        Logger.log(`Aviso: no se pudo eliminar duplicado ${f.getId()}: ${e}`);
+      }
+    }
+  }
+  return newFile;
+}
+
+// -------- Alias para compatibilidad con versiones anteriores --------
+function exportSheetToCSV() {
+  return exportMetadataBM();
+}
