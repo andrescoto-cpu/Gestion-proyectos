@@ -1,0 +1,516 @@
+/**
+ * Formato fecha: DD/MM/YYYY (TIMEZONE: America/Costa_Rica) y reconoce Ñ y tildes
+ * Drive → GitHub con export de Google Docs/Sheets, UTF-8 (NFC), BOM para CSV y nombres/rutas con acentos.
+ */
+
+// ==========================================
+// CONFIGURACIÓN - AJUSTA CON TUS DATOS
+// ==========================================
+const DRIVE_FOLDER_ID = '1ByhS3uEpPKDvK1h-DXLkRj970b3KFkYG';
+
+const GITHUB_USERNAME = 'andrescoto-cpu';
+const GITHUB_REPO     = 'Metadata';      // respeta mayúsculas/minúsculas
+const GITHUB_BRANCH   = 'main';
+const GITHUB_FOLDER   = 'scripts/';      // '' para raíz; puede tener Ñ/acentos
+
+// Extensiones permitidas (archivos “normales”)
+const ALLOWED_EXTENSIONS = ['.gs', '.js', '.html', '.css', '.json', '.md', '.txt', '.csv', '.xlsx', '.xml'];
+
+// MIME reconocidos de Google para exportar
+const GOOGLE_MIME = {
+  DOCS:   'application/vnd.google-apps.document',
+  SHEETS: 'application/vnd.google-apps.spreadsheet',
+  SCRIPT: 'application/vnd.google-apps.script'
+};
+
+// Fecha/Zona horaria
+const TZ = 'America/Costa_Rica';
+const DATE_FMT = 'dd/MM/yyyy HH:mm:ss';
+const fmtCR = d => Utilities.formatDate(new Date(d), TZ, DATE_FMT);
+
+// Token en Script Properties (no lo pongas en el código)
+const SP = PropertiesService.getScriptProperties();
+const GITHUB_TOKEN = SP.getProperty('GITHUB_TOKEN');
+
+// ==========================================
+// Utilidades de Unicode / rutas
+// ==========================================
+function normalizeNFC(s) {
+  try { return (s && typeof s.normalize === 'function') ? s.normalize('NFC') : s; }
+  catch (e) { return s; }
+}
+
+// Codifica path por segmentos (sin slash final)
+function encodePath(path) {
+  const parts = String(path || '').split('/').filter(Boolean);
+  return parts.map(seg => encodeURIComponent(normalizeNFC(seg))).join('/');
+}
+
+// Extrae extensión (en minúscula), o '' si no tiene
+function getExt(name) {
+  const i = String(name).lastIndexOf('.');
+  return i >= 0 ? String(name).substring(i).toLowerCase() : '';
+}
+
+// ¿Tiene extensión permitida?
+function isAllowedByExtension(name) {
+  const ext = getExt(name);
+  return ext && ALLOWED_EXTENSIONS.includes(ext);
+}
+
+// ¿Es tipo Google exportable?
+function isGoogleExportable(mime) {
+  return mime === GOOGLE_MIME.DOCS || mime === GOOGLE_MIME.SHEETS;
+}
+
+// ==========================================
+// Punto de entrada rápido
+// ==========================================
+function myFunction() { runAll(); }
+
+function runAll() {
+  const ok = testGitHubConnection();
+  if (!ok) {
+    Logger.log('⛔ Detenido: revisa GITHUB_TOKEN/permiso del repo.');
+    return;
+  }
+  listGoogleAppsScriptFiles();  // opcional
+  copyDriveFilesToGitHub();
+  verArchivosEnGitHub();        // opcional
+}
+
+// ==========================================
+// Conexión GitHub
+// ==========================================
+function testGitHubConnection() {
+  try {
+    if (!GITHUB_TOKEN) {
+      Logger.log('❌ ERROR: GITHUB_TOKEN no está definido en Script Properties.');
+      Logger.log('   File > Project settings > Script properties > GITHUB_TOKEN');
+      return false;
+    }
+    const url = `https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO}`;
+    const res = UrlFetchApp.fetch(url, {
+      method: 'GET',
+      muteHttpExceptions: true,
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    });
+    if (res.getResponseCode() === 200) {
+      const repo = JSON.parse(res.getContentText());
+      Logger.log('✅ CONEXIÓN EXITOSA');
+      Logger.log(`Repositorio: ${repo.full_name}`);
+      Logger.log(`Rama por defecto: ${repo.default_branch}`);
+      return true;
+    }
+    Logger.log(`❌ ERROR DE CONEXIÓN: ${res.getResponseCode()}`);
+    Logger.log(res.getContentText());
+    return false;
+  } catch (e) {
+    Logger.log(`❌ ERROR: ${e}`);
+    return false;
+  }
+}
+
+// ==========================================
+// Listado informativo (opcional)
+// ==========================================
+function listGoogleAppsScriptFiles() {
+  try {
+    const folder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+    const files = folder.getFiles();
+    let count = 0;
+
+    Logger.log(`\n=== ARCHIVOS EN: ${folder.getName()} ===`);
+    while (files.hasNext()) {
+      const f = files.next();
+      const name = f.getName();
+      const mime = f.getBlob().getContentType();
+      const ext  = getExt(name);
+      Logger.log(`\n📄 ${name}`);
+      Logger.log(`   Tipo: ${mime}`);
+      Logger.log(`   Modificado: ${fmtCR(f.getLastUpdated())}`);
+
+      if (mime === GOOGLE_MIME.SCRIPT) {
+        Logger.log('   ⚠️  Apps Script Project (copiar manual desde editor)');
+      } else if (isAllowedByExtension(name) || isGoogleExportable(mime)) {
+        Logger.log('   ✅ Se puede copiar automáticamente');
+        if (!ext && mime === GOOGLE_MIME.DOCS)   Logger.log('      → Exportaré como .txt');
+        if (!ext && mime === GOOGLE_MIME.SHEETS) Logger.log('      → Exportaré como .xlsx');
+      } else {
+        Logger.log('   ❌ Tipo no soportado actualmente');
+      }
+      count++;
+    }
+    Logger.log(`\n📊 Total de archivos encontrados: ${count}`);
+  } catch (e) {
+    Logger.log(`❌ Error: ${e}`);
+  }
+}
+
+// ==========================================
+// Copia principal
+// ==========================================
+function copyDriveFilesToGitHub() {
+  try {
+    if (!GITHUB_TOKEN) {
+      Logger.log('❌ ERROR: GITHUB_TOKEN no está definido.');
+      return;
+    }
+
+    const folder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+    const files = folder.getFiles();
+    let processed = 0, errors = 0, skipped = 0;
+
+    Logger.log(`\n🚀 Iniciando copia (${fmtCR(new Date())})...`);
+
+    while (files.hasNext()) {
+      const file = files.next();
+      const mime = file.getBlob().getContentType();
+      const originalName = file.getName();
+
+      // Filtrado por extensión o por tipo Google exportable
+      if (!(isAllowedByExtension(originalName) || isGoogleExportable(mime))) {
+        Logger.log(`⏭️  Saltando: ${originalName} (no permitido / no exportable)`);
+        skipped++;
+        continue;
+      }
+
+      try {
+        const payload = getFilePayload(file); // { name, content }
+        if (!payload || payload.content == null) {
+          Logger.log(`⚠️  Sin contenido exportable: ${originalName}`);
+          skipped++;
+          continue;
+        }
+
+        const success = uploadToGitHub(payload.name, payload.content);
+        if (success) {
+          processed++;
+          Logger.log(`✅ Éxito: ${payload.name}`);
+        } else {
+          errors++;
+          Logger.log(`❌ Error al subir: ${payload.name}`);
+        }
+
+        Utilities.sleep(1200); // evita rate limit
+
+      } catch (fileErr) {
+        errors++;
+        Logger.log(`❌ Error con ${originalName}: ${fileErr}`);
+      }
+    }
+
+    Logger.log(`\n=== RESUMEN FINAL (${fmtCR(new Date())}) ===`);
+    Logger.log(`✅ Archivos procesados: ${processed}`);
+    Logger.log(`⏭️  Archivos saltados: ${skipped}`);
+    Logger.log(`❌ Archivos con error: ${errors}`);
+  } catch (e) {
+    Logger.log(`❌ Error general: ${e}`);
+  }
+}
+
+/**
+ * Devuelve { name, content }
+ * - Google Docs → .txt (UTF-8, NFC)
+ * - Google Sheets → .xlsx (bytes)
+ * - Texto normal → respeta nombre; UTF-8 (NFC). Añade BOM si .csv
+ * - Si no tiene extensión y es texto → .txt
+ */
+function getFilePayload(file) {
+  const name = file.getName();
+  const mime = file.getBlob().getContentType();
+  const ext  = getExt(name);
+
+  // Google Apps Script project → no exportable (se avisa)
+  if (mime === GOOGLE_MIME.SCRIPT) {
+    const text = `// Google Apps Script: ${name}\n// Este archivo debe copiarse manualmente desde el editor`;
+    return { name: ensureTxtExt(name), content: normalizeNFC(text) };
+  }
+
+  // Google Docs → .txt (UTF-8)
+  if (mime === GOOGLE_MIME.DOCS) {
+    const outName = ensureTxtExt(name);
+    const text = normalizeNFC(file.getAs('text/plain').getDataAsString('UTF-8'));
+    return { name: outName, content: text };
+  }
+
+  // Google Sheets → .xlsx (bytes)
+  if (mime === GOOGLE_MIME.SHEETS) {
+    const outName = ensureXlsxExt(name);
+    const xlsxBlob = file.getAs('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    return { name: outName, content: xlsxBlob.getBytes() };
+  }
+
+  // Tipos de texto (con o sin extensión)
+  if (mime.startsWith('text/') ||
+      mime === 'application/json' ||
+      mime === 'application/javascript' ||
+      mime === 'text/csv' ||
+      mime === 'text/html' ||
+      mime === 'application/xml' ||
+      mime === 'text/xml' ||
+      mime === 'application/x-www-form-urlencoded') {
+    let outName = name;
+    if (!ext) outName = ensureTxtExt(name); // si no tiene extensión, que sea .txt
+
+    let text = normalizeNFC(file.getBlob().getDataAsString('UTF-8'));
+    // CSV → añade BOM para Excel/Windows
+    if (getExt(outName) === '.csv' && !text.startsWith('\uFEFF')) {
+      text = '\uFEFF' + text;
+    }
+    return { name: outName, content: text };
+  }
+
+  // Binario .xlsx (u otros ya permitidos por extensión) → bytes
+  if (isAllowedByExtension(name)) {
+    const bytes = file.getBlob().getBytes();
+    return { name, content: bytes };
+  }
+
+  // No soportado
+  return null;
+}
+
+function ensureTxtExt(name) {
+  const ext = getExt(name);
+  return ext ? name : (name + '.txt');
+}
+
+function ensureXlsxExt(name) {
+  const ext = getExt(name);
+  return ext === '.xlsx' ? name : (ext ? name.replace(ext, '.xlsx') : (name + '.xlsx'));
+}
+
+// ==========================================
+// Subida GitHub (maneja Ñ/tildes en nombre y carpetas)
+// ==========================================
+function uploadToGitHub(fileName, content) {
+  try {
+    const folderEnc = encodePath(GITHUB_FOLDER || '');
+    const prefix = folderEnc ? folderEnc + '/' : '';
+    const nameEnc = encodeURIComponent(normalizeNFC(fileName));
+    const filePath = `${prefix}${nameEnc}`;
+
+    const url = `https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO}/contents/${filePath}`;
+
+    // ¿Existe? para obtener sha
+    let sha = null;
+    const getRes = UrlFetchApp.fetch(url, {
+      method: 'GET',
+      muteHttpExceptions: true,
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    });
+    if (getRes.getResponseCode() === 200) {
+      sha = JSON.parse(getRes.getContentText()).sha;
+      Logger.log('   📝 Actualizando archivo existente');
+    } else if (getRes.getResponseCode() === 404) {
+      Logger.log('   📄 Creando archivo nuevo');
+    } else {
+      Logger.log(`   ❗ GitHub GET: ${getRes.getResponseCode()} - ${getRes.getContentText()}`);
+    }
+
+    // Base64 (texto/bytes)
+    const base64 = (typeof content === 'string')
+      ? Utilities.base64Encode(Utilities.newBlob(content, 'text/plain; charset=utf-8').getBytes())
+      : Utilities.base64Encode(content);
+
+    const payload = {
+      message: `Auto-sync: ${fileName} desde Google Drive (${fmtCR(new Date())})`,
+      content: base64,
+      branch: GITHUB_BRANCH,
+      ...(sha ? { sha } : {})
+    };
+
+    const putRes = UrlFetchApp.fetch(url, {
+      method: 'PUT',
+      muteHttpExceptions: true,
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json; charset=utf-8'
+      },
+      payload: JSON.stringify(payload)
+    });
+
+    const code = putRes.getResponseCode();
+    if (code === 200 || code === 201) {
+      const data = JSON.parse(putRes.getContentText());
+      Logger.log(`   🔗 URL: ${data.content.html_url}`);
+      return true;
+    }
+    Logger.log(`   ❌ Error GitHub API: ${code} - ${putRes.getContentText()}`);
+    return false;
+
+  } catch (e) {
+    Logger.log(`   ❌ Error upload: ${e}`);
+    return false;
+  }
+}
+
+// ==========================================
+// Utilidades extra
+// ==========================================
+function verArchivosEnGitHub() {
+  try {
+    const folderEnc = encodePath(GITHUB_FOLDER || '');
+    const contentsPath = folderEnc ? `/${folderEnc}` : '';
+    const url = `https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO}/contents${contentsPath}`;
+
+    const res = UrlFetchApp.fetch(url, {
+      method: 'GET',
+      muteHttpExceptions: true,
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    });
+
+    if (res.getResponseCode() === 200) {
+      const files = JSON.parse(res.getContentText());
+      Logger.log(`\n=== ARCHIVOS EN GITHUB ===`);
+      Logger.log(`Repositorio: ${GITHUB_USERNAME}/${GITHUB_REPO}`);
+      Logger.log(`Carpeta: ${GITHUB_FOLDER || 'raíz'}`);
+      Logger.log(`Encontrados: ${files.length} archivos\n`);
+
+      files.forEach((f, i) => {
+        if (f.type === 'file') {
+          Logger.log(`${i + 1}. 📄 ${f.name}`);
+          Logger.log(`   📏 Tamaño: ${f.size} bytes`);
+          Logger.log(`   🔗 URL: ${f.html_url}`);
+          Logger.log(`   🔑 SHA: ${String(f.sha).substring(0, 8)}...`);
+          Logger.log('');
+        }
+      });
+
+      Logger.log(`\n=== URLS RAW ===`);
+      files.forEach(f => {
+        if (f.type === 'file') {
+          const prefix = folderEnc ? (folderEnc + '/') : '';
+          const raw = `https://raw.githubusercontent.com/${GITHUB_USERNAME}/${GITHUB_REPO}/${GITHUB_BRANCH}/${prefix}${encodeURIComponent(normalizeNFC(f.name))}`;
+          Logger.log(`${f.name}: ${raw}`);
+        }
+      });
+    } else if (res.getResponseCode() === 404) {
+      Logger.log('❌ La carpeta no existe en GitHub o está vacía');
+    } else {
+      Logger.log(`❌ Error: ${res.getResponseCode()}`);
+      Logger.log(res.getContentText());
+    }
+  } catch (e) {
+    Logger.log(`❌ Error verificando GitHub: ${e}`);
+  }
+}
+
+/**
+ * Comparación simple por nombre
+ */
+function compararArchivos() {
+  try {
+    const drive = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+    const files = drive.getFiles();
+    const driveNames = [];
+
+    while (files.hasNext()) {
+      const f = files.next();
+      const mime = f.getBlob().getContentType();
+      if (isAllowedByExtension(f.getName()) || isGoogleExportable(mime)) {
+        driveNames.push(f.getName());
+      }
+    }
+
+    const folderEnc = encodePath(GITHUB_FOLDER || '');
+    const contentsPath = folderEnc ? `/${folderEnc}` : '';
+    const url = `https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO}/contents${contentsPath}`;
+    const res = UrlFetchApp.fetch(url, {
+      method: 'GET',
+      muteHttpExceptions: true,
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    });
+
+    const ghNames = (res.getResponseCode() === 200)
+      ? JSON.parse(res.getContentText()).filter(x => x.type === 'file').map(x => x.name)
+      : [];
+
+    Logger.log(`📁 DRIVE (procesables): ${driveNames.length}`);
+    Logger.log(`🐙 GITHUB: ${ghNames.length}`);
+    Logger.log('\n=== COMPARACIÓN (por nombre “lógico”) ===');
+    driveNames.forEach(n => {
+      const expected = n; // mapeo simple; si es Google se transformó antes (txt/xlsx)
+      Logger.log(ghNames.includes(expected) ? `✅ ${expected}` : `❌ Falta en GitHub: ${expected}`);
+    });
+  } catch (e) {
+    Logger.log(`❌ Error en comparación: ${e}`);
+  }
+}
+
+/**
+ * Crear metadata.csv (con BOM) para probar acentos
+ */
+function crearMetadataCSV() {
+  try {
+    if (!GITHUB_TOKEN) {
+      Logger.log('❌ ERROR: GITHUB_TOKEN no está definido.');
+      return false;
+    }
+    const hoy = Utilities.formatDate(new Date(), TZ, 'dd/MM/yyyy');
+    let csv =
+`id,nombre,tipo,fecha_creacion,descripcion
+1,Año_prueba,txt,${hoy},Línea con acentos: á, é, í, ó, ú, Ñ, ñ – prueba
+2,configuración,json,${hoy},Archivo de configuración con tildes
+3,documentación,markdown,${hoy},Documentación del proyecto – España/Información`;
+    if (!csv.startsWith('\uFEFF')) csv = '\uFEFF' + normalizeNFC(csv);
+
+    const folderEnc = encodePath(GITHUB_FOLDER || '');
+    const prefix = folderEnc ? (folderEnc + '/') : '';
+    const url = `https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO}/contents/${prefix}${encodeURIComponent('metadata.csv')}`;
+
+    const payload = {
+      message: 'Crear archivo metadata.csv inicial',
+      content: Utilities.base64Encode(Utilities.newBlob(csv, 'text/csv; charset=utf-8').getBytes()),
+      branch: GITHUB_BRANCH
+    };
+
+    const res = UrlFetchApp.fetch(url, {
+      method: 'PUT',
+      muteHttpExceptions: true,
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json; charset=utf-8'
+      },
+      payload: JSON.stringify(payload)
+    });
+
+    if (res.getResponseCode() === 201) {
+      const data = JSON.parse(res.getContentText());
+      Logger.log('✅ metadata.csv creado');
+      Logger.log(`🔗 URL: ${data.content.html_url}`);
+      return true;
+    }
+    Logger.log(`❌ Error creando metadata.csv: ${res.getResponseCode()} - ${res.getContentText()}`);
+    return false;
+
+  } catch (e) {
+    Logger.log(`❌ Error: ${e}`);
+    return false;
+  }
+}
+
+/**
+ * PRUEBA RÁPIDA: sube un archivo de texto con Ñ/tildes sin depender de Drive
+ */
+function PRUEBA_SUBIDA_RAPIDA() {
+  const nombre = 'Prueba Ñ-áéíóú.txt';
+  const contenido = 'Línea de verificación con acentos: á, é, í, ó, ú, Ñ, ñ.\nOK.';
+  const ok = uploadToGitHub(nombre, contenido);
+  Logger.log(ok ? '✅ PRUEBA OK: Subido con éxito.' : '❌ PRUEBA FALLÓ.');
+}
