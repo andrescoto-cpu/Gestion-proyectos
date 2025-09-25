@@ -3,6 +3,9 @@ import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, CartesianGrid, Toolti
 import { Upload, FileText, Filter, X, Download, ArrowLeft, AlertTriangle, CheckCircle, Clock, Users, TrendingUp, Calendar, Target, BarChart3, RefreshCw, Activity, UserCheck, Zap, Info, Settings, Brain, Lightbulb } from 'lucide-react';
 import Papa from 'papaparse';
 
+
+
+
 // ===============================
 // CONSTANTES DEL SISTEMA ORIGINAL (SIN CAMBIOS)
 // ===============================
@@ -3104,6 +3107,7 @@ const MultimoneySystem = () => {
         </div>
 
         <div className="flex-1 overflow-y-auto p-6">
+
           {activeModule === 'dashboard' && <DashboardModule data={filteredData} />}
           {activeModule === 'ml-insights' && <MLBasicModule data={filteredData} />}
           {activeModule === 'scoring' && <ScoringModule data={filteredData} />}
@@ -3951,5 +3955,6 @@ const ProjectDetailedAnalysis = ({ analysis, onBack }) => {
 // ===============================
 // 🎉 ¡CÓDIGO ML COMPLETADO!
 // ===============================
+// DESPUÉS de este comentario debe seguir tu línea: export default MultimoneySystem;
 
 export default MultimoneySystem;
